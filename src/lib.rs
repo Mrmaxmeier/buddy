@@ -4,7 +4,6 @@
 //! NOTE: Requires `liballoc`, so stuck on nightly for now.
 
 #![no_std]
-#![feature(alloc)]
 
 extern crate alloc;
 
@@ -13,7 +12,7 @@ use core::{
     cmp,
     fmt::Debug,
     mem,
-    ops::{Add, BitAnd, BitXor, Shl},
+    ops::{Add, BitAnd, BitXor, Not, Shl, Sub},
 };
 
 /// Types that have an additive identity value.
@@ -41,8 +40,12 @@ where
     T: Debug,
     T: Shl<usize, Output = T>,
     T: Add<usize, Output = T>,
+    T: Add<T, Output = T>,
+    T: Sub<T, Output = T>,
     T: BitAnd<usize, Output = T>,
+    T: BitAnd<T, Output = T>,
     T: BitXor<Output = T>,
+    T: Not<Output = T>,
 {
     /// The free lists ("bins"). Bin `i` contains allocations of size `1 << i`. The number of bins
     /// determines the maximum allocation size.
@@ -57,8 +60,12 @@ where
     T: Debug,
     T: Shl<usize, Output = T>,
     T: Add<usize, Output = T>,
+    T: Add<T, Output = T>,
+    T: Sub<T, Output = T>,
     T: BitAnd<usize, Output = T>,
+    T: BitAnd<T, Output = T>,
     T: BitXor<Output = T>,
+    T: Not<Output = T>,
 {
     /// Create a new empty buddy allocator with the given number of bins.
     pub fn new(nbins: u8) -> Self {
@@ -131,6 +138,56 @@ where
 
         // Get a value from the given bin.
         self.get_from_bin(order)
+    }
+
+    /// Checks if all parts of the range are available. `start` _and_ `end` are inclusive.
+    pub fn range_is_contiguous(&self, mut start: T, end: T) -> bool {
+        'incr: loop {
+            if start >= end {
+                return true;
+            }
+            for order in 0..self.bins.len() {
+                let mask: T = !((T::one() << order) - T::one());
+                for addr in self.bins[order].iter() {
+                    let buddy_start = *addr & mask;
+                    let buddy_end = buddy_start + (T::one() << order);
+                    if buddy_start <= start && buddy_end >= start {
+                        start = buddy_end + 1;
+                        continue 'incr;
+                    }
+                }
+            }
+            return false;
+        }
+    }
+
+    pub fn remove_range(&mut self, start: T, end: T) {
+        assert!(end > start);
+        assert!(self.range_is_contiguous(start, end));
+        let mut splits = Vec::new();
+        let mut consumed = Vec::new();
+        for order in (0..self.bins.len()).rev() {
+            let mask: T = !((T::one() << order) - T::one());
+            for addr in self.bins[order].range(start & mask..=end) {
+                let buddy_start = *addr;
+                let buddy_end = buddy_start + (T::one() << order);
+                let contains_start = (buddy_start..buddy_end).contains(&start);
+                let contains_end = (buddy_start..buddy_end).contains(&end);
+                consumed.push(*addr);
+                if contains_start || contains_end {
+                    splits.push(*addr);
+                }
+            }
+            for addr in consumed.drain(..) {
+                self.bins[order].remove(&addr);
+            }
+            if order != 0 {
+                for addr in splits.drain(..) {
+                    self.bins[order - 1].insert(addr);
+                    self.bins[order - 1].insert(Self::buddy_of(addr, order - 1));
+                }
+            }
+        }
     }
 
     /// Free the given element(s) to the allocator.
@@ -392,6 +449,27 @@ mod test {
         for i in 0..8 {
             assert_eq!(a.bins[i].len(), 0);
         }
+    }
+
+    #[test]
+    fn test_alloc_at() {
+        let mut a = BuddyAllocator::new(9);
+        a.extend(0, 255);
+        a.remove_range(0, 255);
+        for (i, bin) in a.bins.iter().enumerate() {
+            if !bin.is_empty() {
+                panic!("{}: {:?}", i, bin);
+            }
+            assert!(bin.is_empty());
+        }
+
+        a.extend(0, 255);
+        a.remove_range(64, 191);
+        assert_eq!(a.bins[8].len(), 0);
+        assert_eq!(a.bins[7].len(), 0);
+        assert_eq!(a.bins[6].len(), 2);
+        assert!(a.bins[6].contains(&0));
+        assert!(a.bins[6].contains(&192));
     }
 
     // Test extend when the extension needs to be broken into pieces
